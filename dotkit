@@ -1,0 +1,383 @@
+#!/bin/bash
+set -euo pipefail
+
+# dotkit — personal dotfiles package manager
+# Usage: dotkit <command> [args]
+
+DOTKIT_VERSION="0.1.0"
+
+# Resolve real path through symlinks (needed when invoked via ~/.local/bin/dotkit)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DOTKIT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+DOTKIT_MODULES="${DOTKIT_DIR}/modules"
+DOTKIT_STATE="${DOTKIT_DIR}/.state"
+
+_red()    { printf "\033[0;31m%s\033[0m" "$1"; }
+_green()  { printf "\033[0;32m%s\033[0m" "$1"; }
+_yellow() { printf "\033[0;33m%s\033[0m" "$1"; }
+_blue()   { printf "\033[0;34m%s\033[0m" "$1"; }
+_dim()    { printf "\033[2m%s\033[0m" "$1"; }
+_bold()   { printf "\033[1m%s\033[0m" "$1"; }
+
+info()  { printf "  $(_blue "▸") %s\n" "$1"; }
+ok()    { printf "  $(_green "✓") %s\n" "$1"; }
+warn()  { printf "  $(_yellow "!") %s\n" "$1"; }
+err()   { printf "  $(_red "✗") %s\n" "$1" >&2; }
+
+_available_modules() {
+  for dir in "${DOTKIT_MODULES}"/*/; do
+    [ -f "${dir}module.sh" ] && basename "${dir}"
+  done
+}
+
+_is_installed() {
+  [ -f "${DOTKIT_STATE}/$1.installed" ]
+}
+
+# Sources module.sh — sets MODULE_NAME, MODULE_DESC, MODULE_TARGET and optional hook functions
+_load_module() {
+  local mod="$1"
+  local conf="${DOTKIT_MODULES}/${mod}/module.sh"
+  if [ ! -f "$conf" ]; then
+    err "Module '$mod' not found"
+    return 1
+  fi
+  # Prevent stale hooks from previously sourced module
+  unset -f pre_install post_install pre_uninstall post_uninstall 2>/dev/null || true
+  # shellcheck disable=SC1090
+  source "$conf"
+}
+
+_link_files() {
+  local files_dir="$1"
+  local target_dir="$2"
+  local count=0
+
+  [ -d "$files_dir" ] || return 0
+  mkdir -p "$target_dir"
+
+  for item in "$files_dir"/*  "$files_dir"/.*; do
+    local name
+    name="$(basename "$item")"
+    # .* glob always yields "." and ".." entries
+    [[ "$name" == "." || "$name" == ".." ]] && continue
+    [ -e "$item" ] || continue
+
+    local target="${target_dir}/${name}"
+
+    if [ -L "$target" ]; then
+      local current
+      current="$(readlink "$target")"
+      if [ "$current" = "$item" ]; then
+        ((count++)) || true
+        continue
+      fi
+      rm "$target"
+    elif [ -e "$target" ]; then
+      local backup="${target}.dotkit-backup"
+      warn "Backing up $(basename "$target") → ${backup##*/}"
+      mv "$target" "$backup"
+    fi
+
+    ln -s "$item" "$target"
+    ((count++)) || true
+  done
+
+  echo "$count"
+}
+
+_unlink_files() {
+  local files_dir="$1"
+  local target_dir="$2"
+  local count=0
+
+  [ -d "$files_dir" ] || return 0
+
+  for item in "$files_dir"/* "$files_dir"/.*; do
+    local name
+    name="$(basename "$item")"
+    [[ "$name" == "." || "$name" == ".." ]] && continue
+    [ -e "$item" ] || continue
+
+    local target="${target_dir}/${name}"
+
+    if [ -L "$target" ]; then
+      local current
+      current="$(readlink "$target")"
+      if [ "$current" = "$item" ]; then
+        rm "$target"
+        ((count++)) || true
+
+        local backup="${target}.dotkit-backup"
+        if [ -e "$backup" ]; then
+          mv "$backup" "$target"
+          info "Restored $(basename "$target") from backup"
+        fi
+      fi
+    fi
+  done
+
+  echo "$count"
+}
+
+cmd_install() {
+  local modules=("$@")
+
+  if [ ${#modules[@]} -eq 0 ]; then
+    err "Usage: dotkit install <module...> | all"
+    return 1
+  fi
+
+  if [ "${modules[0]}" = "all" ]; then
+    modules=()
+    while IFS= read -r m; do modules+=("$m"); done < <(_available_modules)
+  fi
+
+  for mod in "${modules[@]}"; do
+    _load_module "$mod" || continue
+
+    local files_dir="${DOTKIT_MODULES}/${mod}/files"
+
+    if _is_installed "$mod"; then
+      info "Reinstalling $(_bold "$MODULE_NAME")..."
+    else
+      info "Installing $(_bold "$MODULE_NAME")..."
+    fi
+
+    if declare -f pre_install >/dev/null 2>&1; then
+      pre_install
+    fi
+
+    local linked
+    linked=$(_link_files "$files_dir" "$MODULE_TARGET")
+    info "${linked} items linked → $(_dim "$MODULE_TARGET")"
+
+    if declare -f post_install >/dev/null 2>&1; then
+      post_install
+    fi
+
+    mkdir -p "$DOTKIT_STATE"
+    date +%Y-%m-%dT%H:%M:%S > "${DOTKIT_STATE}/${mod}.installed"
+
+    ok "$MODULE_NAME installed"
+    echo ""
+  done
+}
+
+cmd_uninstall() {
+  local modules=("$@")
+
+  if [ ${#modules[@]} -eq 0 ]; then
+    err "Usage: dotkit uninstall <module...>"
+    return 1
+  fi
+
+  for mod in "${modules[@]}"; do
+    _load_module "$mod" || continue
+
+    if ! _is_installed "$mod"; then
+      warn "$MODULE_NAME is not installed"
+      continue
+    fi
+
+    local files_dir="${DOTKIT_MODULES}/${mod}/files"
+
+    info "Uninstalling $(_bold "$MODULE_NAME")..."
+
+    if declare -f pre_uninstall >/dev/null 2>&1; then
+      pre_uninstall
+    fi
+
+    local removed
+    removed=$(_unlink_files "$files_dir" "$MODULE_TARGET")
+    info "${removed} symlinks removed"
+
+    if declare -f post_uninstall >/dev/null 2>&1; then
+      post_uninstall
+    fi
+
+    rm -f "${DOTKIT_STATE}/${mod}.installed"
+
+    ok "$MODULE_NAME uninstalled"
+    echo ""
+  done
+}
+
+cmd_update() {
+  info "Updating dotkit..."
+
+  if [ -d "${DOTKIT_DIR}/.git" ]; then
+    cd "$DOTKIT_DIR"
+    git pull --quiet 2>/dev/null && ok "Repository updated" || warn "Git pull failed (offline?)"
+  else
+    warn "Not a git repo — skipping pull"
+  fi
+
+  local installed=()
+  for state_file in "${DOTKIT_STATE}"/*.installed; do
+    [ -f "$state_file" ] || continue
+    local mod
+    mod="$(basename "$state_file" .installed)"
+    installed+=("$mod")
+  done
+
+  if [ ${#installed[@]} -eq 0 ]; then
+    info "No modules installed"
+    return 0
+  fi
+
+  echo ""
+  # Re-link picks up any files changed by git pull
+  info "Re-linking ${#installed[@]} module(s)..."
+  echo ""
+  cmd_install "${installed[@]}"
+}
+
+cmd_list() {
+  printf "\n"
+  printf "  $(_bold "dotkit modules")\n"
+  printf "  %s\n\n" "$(printf '─%.0s' {1..40})"
+
+  local available=()
+  while IFS= read -r m; do available+=("$m"); done < <(_available_modules)
+
+  if [ ${#available[@]} -eq 0 ]; then
+    info "No modules found"
+    return 0
+  fi
+
+  for mod in "${available[@]}"; do
+    _load_module "$mod" 2>/dev/null || continue
+
+    local status_icon
+    if _is_installed "$mod"; then
+      status_icon="$(_green "●")"
+    else
+      status_icon="$(_dim "○")"
+    fi
+
+    printf "  %s  $(_bold "%-12s") %s\n" "$status_icon" "$mod" "$(_dim "$MODULE_DESC")"
+  done
+
+  printf "\n"
+  printf "  $(_dim "● installed  ○ available")\n\n"
+}
+
+cmd_status() {
+  printf "\n"
+  printf "  $(_bold "dotkit status")\n"
+  printf "  %s\n\n" "$(printf '─%.0s' {1..40})"
+
+  local available=()
+  while IFS= read -r m; do available+=("$m"); done < <(_available_modules)
+
+  local installed_count=0
+  local total_links=0
+
+  for mod in "${available[@]}"; do
+    _load_module "$mod" 2>/dev/null || continue
+
+    if ! _is_installed "$mod"; then
+      continue
+    fi
+
+    ((installed_count++)) || true
+    local installed_at
+    installed_at="$(cat "${DOTKIT_STATE}/${mod}.installed")"
+
+    printf "  $(_green "●") $(_bold "$mod")\n"
+    printf "    target:    %s\n" "$(_dim "$MODULE_TARGET")"
+    printf "    installed: %s\n" "$(_dim "$installed_at")"
+
+    local files_dir="${DOTKIT_MODULES}/${mod}/files"
+    local healthy=0
+    local broken=0
+
+    if [ -d "$files_dir" ]; then
+      for item in "$files_dir"/* "$files_dir"/.*; do
+        local name
+        name="$(basename "$item")"
+        [[ "$name" == "." || "$name" == ".." ]] && continue
+        [ -e "$item" ] || continue
+
+        local target="${MODULE_TARGET}/${name}"
+        if [ -L "$target" ]; then
+          local current
+          current="$(readlink "$target")"
+          if [ "$current" = "$item" ]; then
+            ((healthy++)) || true
+          else
+            ((broken++)) || true
+          fi
+        else
+          ((broken++)) || true
+        fi
+      done
+    fi
+
+    ((total_links += healthy)) || true
+    if [ "$broken" -gt 0 ]; then
+      printf "    links:     %s healthy, $(_red "%s broken")\n" "$healthy" "$broken"
+    else
+      printf "    links:     $(_green "%s healthy")\n" "$healthy"
+    fi
+    echo ""
+  done
+
+  if [ "$installed_count" -eq 0 ]; then
+    info "No modules installed. Run: dotkit install <module>"
+    echo ""
+    return 0
+  fi
+
+  printf "  $(_dim "%s module(s), %s symlinks")\n\n" "$installed_count" "$total_links"
+}
+
+cmd_help() {
+  cat <<EOF
+
+  $(_bold "dotkit") v${DOTKIT_VERSION} — personal dotfiles package manager
+
+  $(_bold "USAGE")
+    dotkit <command> [args]
+
+  $(_bold "COMMANDS")
+    install <module...> | all    Install modules (creates symlinks)
+    uninstall <module...>        Uninstall modules (removes symlinks)
+    update                       Pull latest + re-link installed modules
+    list                         Show available modules
+    status                       Show installed module health
+
+  $(_bold "EXAMPLES")
+    dotkit install zsh opencode  Install zsh and opencode modules
+    dotkit install all           Install everything
+    dotkit update                Update all installed modules
+    dotkit list                  See what's available
+
+  $(_bold "MODULES")
+$(for m in $(_available_modules); do echo "    $m"; done)
+
+EOF
+}
+
+case "${1:-}" in
+  install)   shift; cmd_install "$@" ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  update)    cmd_update ;;
+  list|ls)   cmd_list ;;
+  status|st) cmd_status ;;
+  help|-h|--help) cmd_help ;;
+  version|-v|--version) echo "dotkit v${DOTKIT_VERSION}" ;;
+  *)
+    if [ -n "${1:-}" ]; then
+      err "Unknown command: $1"
+    fi
+    cmd_help
+    ;;
+esac
