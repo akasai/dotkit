@@ -1,5 +1,7 @@
 # dotkit
 
+[한국어](README.ko.md)
+
 Personal dotfiles package manager. Install only what you need, keep every machine in sync.
 
 ## Install
