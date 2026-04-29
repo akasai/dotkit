@@ -2,6 +2,8 @@
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
     ["omo-olympus@latest", {"enabled": true}],
-    ["opencode-tokscale", {"enabled": true}]
+    ["opencode-tokscale", {"enabled": true}],
+    ["opencode-plugin-codex-usage", {"refreshMs": 30000}],
+    ["opencode-claude-usage", {"enabled": true}]
   ]
 }
